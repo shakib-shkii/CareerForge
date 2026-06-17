@@ -1,7 +1,7 @@
 import { callAI, getAIConfig } from './aiProviders';
 import type { UserProfile, ATSResult, TailoredResume } from '../types';
 
-const GOOGLE_DEFAULT_MODEL = 'gemini-flash-latest';
+const GOOGLE_DEFAULT_MODEL = 'gemini-3.5-flash';
 
 export function initGemini(_apiKey: string) {
   // Keep the function for legacy call sites. The actual request now uses direct REST calls.
@@ -24,11 +24,14 @@ export async function testGeminiConnection(
     if (message.includes('PERMISSION_DENIED') || message.includes('API_KEY_SERVICE_BLOCKED')) {
       return {
         success: false,
-        error: 'Permission denied. Enable the Generative Language API in Google Cloud Console.',
+        error: 'Permission denied for this API key. Create/use a Gemini API key from Google AI Studio and ensure API restrictions do not block Generative Language API.',
       };
     }
     if (message.includes('QUOTA_EXCEEDED') || message.includes('quota')) {
       return { success: false, error: 'API quota exceeded. Try again later.' };
+    }
+    if (message.includes('UNAVAILABLE') || message.includes('high demand') || message.includes('temporarily unavailable')) {
+      return { success: false, error: 'Gemini free tier is under high demand right now. The app now auto-retries and falls back to alternate free models. Please try again.' };
     }
     if (message.includes('Failed to fetch') || message.includes('NetworkError') || message.includes('fetch')) {
       return { success: false, error: 'Network error. Check your internet connection.' };

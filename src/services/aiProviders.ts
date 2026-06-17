@@ -29,8 +29,58 @@ export interface AIConfig {
   baseUrl?: string;
 }
 
-const GOOGLE_DEFAULT_MODEL = 'gemini-flash-latest';
+const GOOGLE_DEFAULT_MODEL = 'gemini-3.5-flash';
+const GOOGLE_FALLBACK_MODELS = [
+  'gemini-flash-latest',
+  'gemini-3.5-flash',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+];
 const ENV_GOOGLE_API_KEY = (import.meta.env.VITE_GOOGLE_API_KEY || '') as string;
+const googleModelCache = new Map<string, string[]>();
+
+async function discoverGoogleGenerateContentModels(apiKey: string): Promise<string[]> {
+  if (googleModelCache.has(apiKey)) {
+    return googleModelCache.get(apiKey) || [];
+  }
+
+  try {
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        'X-goog-api-key': apiKey,
+      },
+    });
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const data = await response.json();
+    const allModels = Array.isArray(data?.models) ? data.models : [];
+    const discovered = allModels
+      .filter((model: any) => {
+        const methods = model?.supportedGenerationMethods;
+        const supportsGenerateContent = Array.isArray(methods) && methods.includes('generateContent');
+        if (!supportsGenerateContent) return false;
+
+        const modelName = String(model?.name || '').replace(/^models\//, '');
+        if (!modelName.startsWith('gemini-')) return false;
+
+        // Exclude non-text and specialized endpoints not intended for this app flow.
+        return !/(image|live|tts|embedding|veo|lyria|computer-use|deep-research|robotics)/i.test(modelName);
+      })
+      .map((model: any) => String(model?.name || '').replace(/^models\//, ''));
+
+    const uniqueDiscovered = Array.from(new Set(discovered));
+    googleModelCache.set(apiKey, uniqueDiscovered);
+    return uniqueDiscovered;
+  } catch {
+    return [];
+  }
+}
 
 // Get saved AI configuration and fall back to environment key when available
 export function getAIConfig(): AIConfig {
@@ -73,13 +123,15 @@ export const AI_PROVIDERS: AIProvider[] = [
     description: 'Google AI with Gemini Flash free tier for resume tailoring, ATS checking, and CV parsing.',
     icon: '🔷',
     website: 'https://ai.google.dev',
-    docsUrl: 'https://console.cloud.google.com/apis/credentials',
+    docsUrl: 'https://ai.google.dev/gemini-api/docs/api-key',
     features: ['Resume Tailoring', 'ATS Checking', 'CV Parsing', 'Cover Letters'],
     isFree: true,
     rateLimit: '15 RPM (free tier)',
     status: 'available',
     models: [
-      { id: GOOGLE_DEFAULT_MODEL, name: 'Gemini Flash Latest', description: 'Latest free-tier Gemini Flash model', contextLength: 2097152, isFree: true },
+      { id: GOOGLE_DEFAULT_MODEL, name: 'Gemini 3.5 Flash', description: 'Current recommended flash model', contextLength: 2097152, isFree: true },
+      { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', description: 'Lower-latency fallback model', contextLength: 1048576, isFree: true },
+      { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', description: 'High-volume fallback model', contextLength: 1048576, isFree: true },
     ],
   },
   {
@@ -241,8 +293,6 @@ async function callGoogleAI(prompt: string, config: AIConfig): Promise<string> {
     throw new Error('No Google API key available for Google AI request.');
   }
 
-  const isAuthKey = apiKey.startsWith('AQ.') || apiKey.startsWith('ya29.');
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent${isAuthKey ? '' : `?key=${encodeURIComponent(apiKey)}`}`;
   const payload = {
     contents: [
       {
@@ -260,47 +310,98 @@ async function callGoogleAI(prompt: string, config: AIConfig): Promise<string> {
     },
   };
 
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 60000);
+  const discoveredModels = await discoverGoogleGenerateContentModels(apiKey);
+  const modelCandidates = Array.from(
+    new Set([modelName, GOOGLE_DEFAULT_MODEL, ...GOOGLE_FALLBACK_MODELS, ...discoveredModels].filter(Boolean))
+  );
+  const transientStatusCodes = new Set([429, 500, 502, 503, 504]);
+  let lastTransientError = '';
+  let lastModelError = '';
+
+  const parseTextFromResponse = (data: any): string => {
+    return (
+      data?.candidates?.[0]?.content?.[0]?.text ||
+      data?.candidates?.[0]?.content?.parts?.[0]?.text ||
+      data?.candidates?.[0]?.text ||
+      data?.output?.[0]?.content?.[0]?.text ||
+      data?.output?.[0]?.text ||
+      data?.response?.output?.[0]?.content?.[0]?.text ||
+      data?.response?.output?.[0]?.text ||
+      ''
+    );
+  };
+
+  const isTransientError = (status: number, errorText: string): boolean => {
+    if (transientStatusCodes.has(status)) {
+      return true;
+    }
+    return /UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|temporar/i.test(errorText || '');
+  };
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json',
+    // Gemini API keys (including newer AQ.* format) must be sent as API keys, not OAuth bearer tokens.
+    'X-goog-api-key': apiKey,
   };
-  if (isAuthKey) {
-    headers.Authorization = `Bearer ${apiKey}`;
-  } else {
-    headers['X-goog-api-key'] = apiKey;
+
+  for (const candidateModel of modelCandidates) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(candidateModel)}:generateContent`;
+
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 60000);
+      let response: Response;
+
+      try {
+        response = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
+      if (response.ok) {
+        const data = await response.json();
+        const text = parseTextFromResponse(data);
+        if (!text) {
+          throw new Error(`Empty response from Google AI: ${JSON.stringify(data)}`);
+        }
+        return text;
+      }
+
+      const errorText = await response.text();
+      const normalizedError = (errorText || '').toLowerCase();
+
+      if (response.status === 404 || normalizedError.includes('not found') || normalizedError.includes('unknown model')) {
+        lastModelError = `Model ${candidateModel} is unavailable: ${errorText}`;
+        break;
+      }
+
+      if (!isTransientError(response.status, errorText)) {
+        throw new Error(`Google AI request failed (${response.status}): ${errorText}`);
+      }
+
+      lastTransientError = `Google AI request failed (${response.status}) on model ${candidateModel}: ${errorText}`;
+      if (attempt < 2) {
+        await sleep(500 * attempt);
+      }
+    }
   }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-    signal: controller.signal,
-  });
-  clearTimeout(timeoutId);
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Google AI request failed (${response.status}): ${errorText}`);
+  if (lastTransientError) {
+    throw new Error(`Google AI is temporarily unavailable. Please retry in a moment. Details: ${lastTransientError}`);
   }
 
-  const data = await response.json();
-  const text =
-    data?.candidates?.[0]?.content?.[0]?.text ||
-    data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-    data?.candidates?.[0]?.text ||
-    data?.output?.[0]?.content?.[0]?.text ||
-    data?.output?.[0]?.text ||
-    data?.response?.output?.[0]?.content?.[0]?.text ||
-    data?.response?.output?.[0]?.text ||
-    '';
-
-  if (!text) {
-    throw new Error(`Empty response from Google AI: ${JSON.stringify(data)}`);
+  if (lastModelError) {
+    throw new Error(`Google AI model selection failed. ${lastModelError}`);
   }
 
-  return text;
+  throw new Error('Google AI request failed for all configured models.');
 }
 
